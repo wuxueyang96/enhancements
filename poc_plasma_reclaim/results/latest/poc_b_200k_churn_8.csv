@@ -1,0 +1,5 @@
+phase,iteration,churned,generation,input_target,input_validation,output_target,output_validation,visited_chunks,elapsed_us,candidate_bytes,deep_arrival,reached_end,valid
+mutation,0,1,200009,115204096,0,115204096,48651968,168930,10000.939,0,0,0,1
+mutation,1,0,200009,115204096,48651968,115204096,95151872,161458,10000.669,0,0,0,1
+mutation,2,0,200009,115204096,95151872,115204096,115201280,69617,3348.002,0,1,0,1
+summary,churn_every=8,mutation_iterations=3,arrived_during_mutation=1,scheduled_mutations=1,generation_resets=1,recovery_iterations=0,recovery_required=0,recovered_same_cursor=0,deep_reached=1,deep_target=115204096

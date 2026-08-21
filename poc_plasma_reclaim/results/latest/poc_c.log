@@ -1,0 +1,17 @@
+# scope=standalone-dlmalloc+real-scanner+real-controller+MADV_REMOVE; no-PlasmaStore/no-Store-mutex/no-fallback; deprecated --fallback is ignored; deep-cursor verdict belongs to PoC-B
+# schedule_mode=virtual-no-sleep; returned schedule_next/next_delay are honored by advancing controller time without sleeping
+# live=64 logical=4194304 physical: touched=272646144 after_free=272646144 L/P=0.015384
+
+# ===== VERDICT =====
+# live_data_intact           : PASS
+# cross_step_live_verified   : 10000 object-checks
+# terminal_state             : NoProgress after 256 drain Steps (PASS)
+# physical_active_drop       : 255.4 MiB (272646144 -> 4800512)
+# physical_post_stop_drop    : 0.3 MiB (4800512 -> 4460544)
+# physical_total_drop        : 255.8 MiB (PASS)
+# active_scan                : visits=2500 topology_changes=2499 validation_resets=2499 target_progress=10070.4MiB validation_progress=504316.1MiB target_stalls=0 zero_progress=0 reached_end=17 generation_mismatches=0 visited_chunks=261044
+# drain_scan                 : visits=255 target_progress=1025.6MiB validation_progress=1168.0MiB reached_end=2 visited_chunks=511
+# advised_bytes_supplemental : active=9995.2MiB drain=1019.5MiB
+# observed_drop_supplemental : active=267.8MiB drain=0.3MiB
+# starvation_signal          : not observed at this scale; use PoC-B for the deep-cursor verdict
+# overall                    : PASS

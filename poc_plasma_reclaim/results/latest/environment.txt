@@ -1,0 +1,22 @@
+format_version=1
+generated_at_utc=2026-08-21T05:07:30Z
+kernel=Linux 5.15.120.bsk.3-amd64 x86_64 GNU/Linux
+os_PRETTY_NAME="veLinux GNU/Linux 2 (lyra)"
+os_VERSION_ID="2"
+os_ID=velinux
+page_size=4096
+online_cpus=32
+process_Cpus_allowed_list:0-31
+process_Mems_allowed_list:0
+tmpfs=tmpfs  rw,nosuid,nodev
+tmpfs_capacity_bytes=66346459136
+shmem_thp=always within_size advise [never] deny force
+git_revision=ed00f456179e0ea4e9254a639e4ca2a30e5496af
+git_dirty=true
+lc_all=C
+cxx_path=/usr/bin/g++
+cxx=g++ (Debian 12.2.0-14+deb12u1) 12.2.0
+cppflags=
+cxxflags=-O2 -g
+make=GNU Make 4.3
+suite_mode=all

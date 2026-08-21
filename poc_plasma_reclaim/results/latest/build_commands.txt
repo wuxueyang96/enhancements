@@ -1,0 +1,13 @@
+make: Entering directory '/data00/home/wuxueyang.wxy/enhancements/poc_plasma_reclaim'
+test "$(uname -s)" = Linux || { \
+	echo "error: PoC-B/C require Linux (tmpfs and MADV_REMOVE)" >&2; \
+	exit 1; \
+}
+g++  -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Wconversion -Wshadow \
+	-Wno-conversion -Wno-shadow -c -o standalone_allocator.o standalone_allocator.cc
+g++  -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Wconversion -Wshadow -c -o standalone_trimmer.o standalone_trimmer.cc
+g++  -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread \
+	-o poc_b_cursor_rebuild poc_b_cursor_rebuild.cc standalone_allocator.o standalone_trimmer.o
+g++  -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread \
+	-o poc_c_active_trim_churn poc_c_active_trim_churn.cc standalone_allocator.o standalone_trimmer.o
+make: Leaving directory '/data00/home/wuxueyang.wxy/enhancements/poc_plasma_reclaim'
