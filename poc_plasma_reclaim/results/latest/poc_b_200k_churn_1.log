@@ -1,0 +1,3 @@
+# arena=202.1 MiB live_objs=200000 obj_bytes=512 churn_bytes=64 deep_free=16.0 MiB churn_every=1 quantum=10 ms
+# setup complete: actual_allocations=200005 primary_logical=102400192 topology_generation=200007
+# discovered deep range: allocation_offset=115201344 range_offset=115204096 range_bytes=4194304 validation_offset=115201280 visited=400005

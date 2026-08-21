@@ -1,0 +1,10 @@
+/poc_b_cursor_rebuild
+/poc_b_cursor_rebuild.dSYM/
+/poc_c_active_trim_churn
+/poc_c_active_trim_churn.dSYM/
+/poc_a
+/*.o
+/results/replayed/
+
+# Keep reproducible PoC result logs (override root-level LaTeX *.log rule).
+!results/latest/*.log

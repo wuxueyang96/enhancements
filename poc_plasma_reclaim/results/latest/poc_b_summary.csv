@@ -1,0 +1,10 @@
+scale,live_objects,churn_every,mutation_iterations,arrived_during_mutation,scheduled_mutations,generation_resets,recovery_iterations,recovery_required,recovered_same_cursor,deep_reached,deep_target
+200k,200000,0,3,1,0,0,0,0,0,1,115204096
+200k,200000,8,3,1,1,1,0,0,0,1,115204096
+200k,200000,4,3,1,1,1,0,0,0,1,115204096
+200k,200000,2,4,1,2,2,0,0,0,1,115204096
+200k,200000,1,4000,0,4000,4000,2,1,1,1,115204096
+500k,500000,0,8,1,0,0,0,0,0,1,288002048
+500k,500000,1,400,0,400,400,7,1,1,1,288002048
+1m,1000000,0,15,1,0,0,0,0,0,1,576004096
+1m,1000000,1,400,0,400,400,15,1,1,1,576004096

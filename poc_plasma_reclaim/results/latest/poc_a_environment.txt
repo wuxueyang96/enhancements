@@ -1,0 +1,16 @@
+kernel=Linux 5.15.120.bsk.3-amd64 x86_64
+page_size=4096
+allowed_cpu_count=32
+allowed_cpu_list=0-31
+tmpfs_path=/dev/shm
+tmpfs_available_bytes=62340395008
+shmem_thp=always within_size advise [never] deny force
+memory_psi_some_avg10=0.00
+runs=3
+seed=20260820
+region_mib=4096
+samples_per_cell=1024
+warmup_per_cell=32
+ranges_mib=1,4,16
+dedicated_active_client_limit=31
+skipped_active_cases=32,64
