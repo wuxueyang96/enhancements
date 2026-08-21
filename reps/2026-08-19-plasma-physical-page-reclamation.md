@@ -442,7 +442,7 @@ sequenceDiagram
     T-->>E: cursor, advised bytes, observed P drop
     E->>E: schedule at most one successor and unlock
     E->>C: process Create on a later event-loop turn
-    C->>A: Allocate; a punched range may fault in new backing
+    C->>A: Allocate, a punched range may fault in new backing
     E->>T: next quantum rechecks current L/P
 ```
 
