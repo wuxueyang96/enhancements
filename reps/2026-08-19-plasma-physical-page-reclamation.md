@@ -138,6 +138,21 @@ owners is welcome before the proposal leaves draft.
 
 ## Design and Architecture
 
+### Terminology
+
+| Term | Meaning in this REP |
+|---|---|
+| Primary arena | The long-lived shared tmpfs mapping from which Plasma normally allocates objects. Fallback files are outside this arena. |
+| Chunk | A dlmalloc allocation unit, including allocator bookkeeping. A chunk can span pages, and a page can contain parts of multiple chunks. |
+| Logical bytes (`L`) | Bytes currently allocated from the primary arena: `Allocated() - FallbackAllocated()`. Freeing an object reduces this quantity. |
+| Backing bytes (`P`) | Blocks allocated to the primary tmpfs file, measured by `fstat(primary_fd).st_blocks * 512`. This is distinct from logical allocation and process RSS. |
+| RSS / PTE | RSS measures resident mappings in one process; a page-table entry (PTE) maps a virtual page in that process. Dropping a mapping does not necessarily release shared file backing. |
+| Candidate | A backed, complete page in an allocator-certified free interior, eligible for physical reclaim. |
+| Recommit / backing admission | Synchronously reserving backing with `fallocate(FALLOC_FL_KEEP_SIZE)` before dlmalloc or a client may write a potentially sparse page. |
+| Allocation envelope | The page-aligned range covering the selected allocation and source-local metadata writes needed to allocate or split its chunk. |
+| Quantum / Store turn | One synchronous, budgeted trim callback. It returns to the Store event loop before a successor callback runs. |
+| Primary allocation pressure | A pending primary-arena Create or an observed primary allocator OOM, including an OOM followed by successful eviction or fallback recovery. |
+
 ### Goals and non-goals
 
 The design has the following goals:
@@ -180,16 +195,18 @@ flowchart LR
   H1 --> C[mark safe full pages CANDIDATE]
 
   T[Store trim timer] --> Q[bounded page-index scan]
-  Q --> BR[claim CANDIDATE as BUSY REMOVE]
+  Q --> BR[claim CANDIDATE or RETRY_PENDING range]
   BR --> M[MADV_REMOVE]
-  M --> NR[NEEDS_RECOMMIT]
+  M -->|success| NR[NEEDS_RECOMMIT]
+  M -->|EAGAIN| RP[RETRY_PENDING]
+  RP --> Q
 
   CR[Create] --> DL[dlmalloc selects source]
   DL --> H2[pre-write hook]
-  H2 --> E[classify writes and compute sparse envelope]
-  E --> BC[claim sparse pages as BUSY COMMIT]
-  BC --> FA[fallocate KEEP_SIZE]
+  H2 --> E[compute allocation envelope]
+  E -->|backing required| FA[fallocate KEEP_SIZE]
   FA --> CO[COMMITTED]
+  E -->|already backed| CO
   CO --> AM[allocator metadata mutation]
   AM --> R[return writable buffer]
 ```
@@ -199,8 +216,8 @@ Responsibilities are deliberately narrow:
 | Component | Responsibility |
 |---|---|
 | dlmalloc adapter | Invoke a post-coalesce observation hook and a pre-first-write admission hook on every allocation source path. |
-| `PlasmaAllocator` | Own the page ledger, summaries, state transitions, bootstrap preparation, and preparation error. |
-| `PhysicalPageTrimmer` | Own the persistent normal/retry cursors, apply the logical/backing policy, and run a bounded remove quantum. |
+| `PlasmaAllocator` | Own the two page bitmaps, reclaimable-page count, in-flight claim, bootstrap preparation, and preparation error. |
+| `PhysicalPageTrimmer` | Own one persistent page cursor for candidates and retries, apply the logical/backing policy, and run a bounded remove quantum. |
 | `PlasmaStore` | Serialize Create/Free/trim, prioritize Create and OOM recovery, translate preparation errors, and stop callbacks before shutdown. |
 
 The proposed implementation does not add an allocator-mutating worker thread.
@@ -232,60 +249,50 @@ only allocator hooks and the page ledger establish that.
 
 ### Allocator hooks and the fixed page-state ledger
 
-The allocator stores one 2-bit state for every 4 KiB primary-arena page. The
-packed numeric values are an implementation detail, not a compatibility
+The allocator stores two fixed bitmaps, each using one bit per primary-arena
+page: `reclaimable` and `recommit_required`. Together they encode four persistent
+states. The numeric encoding is an implementation detail, not a compatibility
 contract:
 
-| State | Meaning |
-|---|---|
-| `COMMITTED` | No known hole risk. The page may be live, protected metadata, or conservatively tracked free space. |
-| `CANDIDATE` | A backed page certified as a metadata-safe interior of a current free chunk. |
-| `NEEDS_RECOMMIT` | The page is initially sparse, removed, or may have been removed; it must be admitted before any write. |
-| `BUSY` | The page belongs to an in-flight REMOVE or COMMIT operation descriptor. |
+| Bits `(reclaimable, recommit_required)` | State | Meaning |
+|---|---|---|
+| `00` | `COMMITTED` | No known hole risk. The page may be live, protected metadata, or conservatively tracked free space. |
+| `10` | `CANDIDATE` | A backed page certified as a metadata-safe interior of a current free chunk. |
+| `01` | `NEEDS_RECOMMIT` | Initially sparse or possibly removed; admission is required before any write, but no further REMOVE is pending. |
+| `11` | `RETRY_PENDING` | A metadata-safe free page whose REMOVE had a retryable result. It remains eligible for REMOVE and requires admission before reuse. |
 
-With 4 KiB pages, the ledger costs about 1.875 MiB for a 30 GiB arena,
-6.25 MiB for 100 GiB, and 64 MiB for 1 TiB. A coarse 2 MiB region summary may
-cache candidate occupancy to skip empty words; it cannot override per-page
-truth. The same fixed region table also carries one required transient-retry
-bit per region (about 6.25 KiB for 100 GiB or 64 KiB for 1 TiB), so retry
-provenance never grows with the number of failures.
+With 4 KiB pages, the two bitmaps together cost about 1.875 MiB for a 30 GiB
+arena, 6.25 MiB for 100 GiB, and 64 MiB for 1 TiB. Candidate and retry discovery
+use the same `reclaimable` bitmap and page cursor; there is no separate region
+retry bitmap or retry cursor.
 
-Allowed transitions are:
+The stable-state transitions are:
 
 ```text
-COMMITTED       --post-free certification--> CANDIDATE
-CANDIDATE       --claim REMOVE-------------> BUSY
-BUSY            --REMOVE may have run------> NEEDS_RECOMMIT
-BUSY            --initial REMOVE not run---> CANDIDATE
-BUSY            --retry REMOVE not run-----> NEEDS_RECOMMIT
-CANDIDATE       --allocation cancels trim--> COMMITTED
-NEEDS_RECOMMIT  --claim COMMIT-------------> BUSY
-NEEDS_RECOMMIT  --deferred REMOVE retry----> BUSY
-BUSY            --fallocate succeeds-------> COMMITTED
-BUSY            --fallocate fails----------> NEEDS_RECOMMIT
+COMMITTED                  --post-free certification--> CANDIDATE
+CANDIDATE / RETRY_PENDING  --REMOVE succeeds----------> NEEDS_RECOMMIT
+CANDIDATE / RETRY_PENDING  --REMOVE returns EAGAIN-----> RETRY_PENDING
+CANDIDATE / RETRY_PENDING  --other issued REMOVE error-> NEEDS_RECOMMIT
+CANDIDATE / RETRY_PENDING  --REMOVE not attempted------> unchanged
+CANDIDATE                  --allocation admitted------> COMMITTED
+NEEDS_RECOMMIT / RETRY_PENDING --fallocate succeeds----> COMMITTED
+any envelope state         --admission fails----------> unchanged
 ```
 
-The safety asymmetry is intentional. A false positive for
-`NEEDS_RECOMMIT` causes an extra `fallocate`; a false negative can cause
-`SIGBUS` and is forbidden. Metrics, `st_blocks`, and an observed zero-filled
-page never downgrade `NEEDS_RECOMMIT` to `COMMITTED`.
+The safety asymmetry is intentional. A false positive in `recommit_required`
+causes an extra `fallocate`; a false negative can cause `SIGBUS` and is
+forbidden. Metrics, `st_blocks`, and an observed zero-filled page never clear
+this bit. Both `NEEDS_RECOMMIT` and `RETRY_PENDING` require backing admission
+before allocator or client writes; only the latter remains scheduled for REMOVE.
 
-`NEEDS_RECOMMIT` is also a quarantine: bootstrap and REMOVE may assign it only
-to data pages that are safe from allocator/client writes. Such a page remains
-free until allocation admission changes it to `COMMITTED`, which is why a
-bounded deferred REMOVE retry may safely re-examine this state.
-
-Each `BUSY` range has an owner descriptor
-`{kind, begin_page, end_page, operation_id}`. Only that owner, or its RAII
-cleanup on every exit path, may finalize the range. Store serialization in the
-proposed implementation means contention should be rare, but this ownership rule
-is required for any asynchronous implementation.
-
-A timeout or non-owner must not guess a stable state for `BUSY`. If completion
-ownership is lost while the process remains alive, the range stays quarantined
-and overlapping allocation fails closed. A raylet process exit needs no
-persistent recovery: the unlinked arena fd, VMA, ledger, and operation state are
-destroyed together.
+An in-flight REMOVE is represented separately by one claimed range containing
+its address and page interval. This is the transient busy state, not a fifth
+bitmap encoding. Claim, syscall, and matching finalization run synchronously
+while allocation and free are excluded. Allocation/free entry points reject an
+outstanding claim rather than waiting on it. Admission also runs synchronously:
+it leaves the bitmap unchanged until backing preparation succeeds, so it needs
+neither a COMMIT claim nor bitmap rollback on failure. A raylet process exit
+destroys the unlinked arena, ledger, and in-flight state together.
 
 ### Sparse bootstrap
 
@@ -323,23 +330,53 @@ admission hook after establishing sparse-page state.
 
 ### Free path: certify reclaim candidates
 
-The post-free hook runs under the allocator mutation gate, after dlmalloc has
-finished all forward/backward coalescing and written the final free-chunk
-metadata. It receives the final free interval and excludes every byte that may
-contain a chunk header, free-list link, footer, boundary tag, segment marker, or
-other allocator-owned word.
+The post-free hook runs under the allocator mutation gate once dlmalloc has
+determined the final coalesced chunk. It receives that chunk's interval and
+bookkeeping size, together with the original chunk being released. Some bin-link
+writes follow the hook; their pages remain protected, and trimming cannot
+interleave with these allocator mutations.
 
-Only complete pages in the safe interior are eligible:
+The final chunk's leading bookkeeping contains its header and free-list links,
+including tree links where applicable. For an ordinary free chunk, the footer is
+stored in the next chunk's `prev_foot` at `chunk_end`, outside the half-open free
+interval. The top chunk instead borders a reserved segment tail containing a
+fake trailing header; that tail also stays outside the reclaimable interval.
+The outer bounds for eligible complete pages are therefore:
 
 ```text
 safe_begin = AlignUp(chunk_begin + required_leading_metadata, page_size)
-safe_end   = AlignDown(chunk_end - required_trailing_metadata, page_size)
+safe_end   = AlignDown(chunk_end, page_size)
 ```
 
-For `[safe_begin, safe_end)`, `COMMITTED` pages become `CANDIDATE`.
-`NEEDS_RECOMMIT` pages remain `NEEDS_RECOMMIT`; freeing an allocation does
-not prove that a previously removed page has backing. Pages shared with live
-payload or allocator metadata remain `COMMITTED`.
+```mermaid
+flowchart LR
+  subgraph FREE["Final coalesced free chunk: chunk_begin to chunk_end, end excluded"]
+    direction LR
+    H["Protected pages<br/>final header and free-list/tree links"]
+    I["Complete interior pages<br/>safe_begin to safe_end, end excluded"]
+    T["Optional trailing partial page<br/>protected"]
+    H --- I --- T
+  end
+  N["Next chunk or reserved segment tail<br/>protected boundary metadata"]
+  T --- N
+```
+
+The leading pages remain protected even if only part of a page contains
+bookkeeping. The optional trailing partial page cannot be removed because it
+also contains boundary metadata from the next chunk or reserved tail. If
+`chunk_end` is page-aligned, that metadata begins on the next page; there is no
+unconditional last-page exclusion. An empty aligned interior yields no candidates.
+
+Each Free marks only the newly exposed window: the released chunk and old
+adjacent bookkeeping, rounded outward to include newly complete pages, then
+intersected with these safety bounds. Existing free neighbors retain their
+ledger state without rescanning their entire interiors. After coalescing, an old
+internal header is no longer allocator metadata and its page can become eligible;
+the surviving outer header and neighboring live pages remain protected.
+
+Within that window, `COMMITTED` pages become `CANDIDATE`. `NEEDS_RECOMMIT`
+and `RETRY_PENDING` pages retain their states; freeing a chunk does not prove
+that a previously removed page has backing.
 
 Free performs no synchronous `MADV_REMOVE`. Ledger marking still scales with
 the safe page/word span and must be benchmarked, but it avoids size-dependent
@@ -352,17 +389,18 @@ The controller starts only after
 `plasma_physical_trim_low_ratio_grace_ms`, and stops when
 `L/P >= plasma_physical_trim_stop_ratio`. While trimming, one Store turn:
 
-1. enters the allocator mutation gate and yields immediately if Create/OOM
-   work has priority;
+1. enters the allocator mutation gate and suspends if primary allocation
+   pressure is pending;
 2. resamples `L` and `P`;
 3. scans the fixed page-state array from a persistent `page_cursor`;
-4. claims contiguous `CANDIDATE` runs as `BUSY/REMOVE`, capped at 4 MiB;
+4. claims contiguous set bits in `reclaimable` (`CANDIDATE` or
+   `RETRY_PENDING`), capped at 4 MiB per range;
 5. calls `MADV_REMOVE` and finalizes the states described below;
 6. advances the cursor past every inspected range, including failed ranges; and
-7. stops when either 128 MiB worth of page indices has been inspected,
-   128 MiB has been advised, 32 remove calls have been attempted, the soft
-   10 ms deadline is reached, a state transition occurs, or Create pressure
-   appears, then returns control to the event loop.
+7. stops at the 128 MiB scan budget, arena end, an error, or the soft 10 ms
+   deadline, then resamples usage and returns control to the event loop. An
+   already claimed range is finalized even if its scan crossed the deadline;
+   newly arriving Create requests run after this synchronous turn returns.
 
 No raw dlmalloc pointer, chunk offset, or topology generation is retained across
 turns. Allocations and frees update page states but never reset the page cursor.
@@ -375,11 +413,25 @@ turn earlier, so the design does not claim an unconditional turn-count bound.
 This is a bounded-progress **mechanism**, not a guarantee that every free page
 is reclaimed: an adversarial workload may reuse a candidate before removal.
 
-After a complete ledger pass with no removable page, the controller enters
-`NO_PROGRESS` instead of spinning. A new certified candidate, a new low-ratio
-episode, or a pending remove-retry deadline wakes it. No topology-prefix
-reconstruction, generation reset, normal/catch-up pass pair, or unbounded
-rescanning policy is part of this design.
+Pages freed behind the cursor remain marked. When the cursor reaches arena end
+and reclaimable pages remain, the next quantum wraps to page zero. Allocation
+or Free does not cause an immediate restart. A successfully removed page has its
+`reclaimable` bit cleared, so wrapping does not by itself advise that page again.
+
+This replaces the earlier chunk scanner's bounded catch-up policy. The fixed
+page cursor does not need to reconstruct a chunk prefix after topology changes,
+or distinguish one normal pass from a special catch-up pass. Normal wraparound
+still occurs; there is no fixed two-pass limit per trimming episode. Each turn
+remains bounded, while new candidates, allocation pressure, and policy determine
+whether later turns run.
+
+`NO_PROGRESS` means that the reclaimable-page count has reached zero, not that
+the last syscall failed to lower `st_blocks`, and does not require a full scan
+to establish. While the free generation is unchanged, controller checks perform
+no page scan. A Free that adds newly eligible pages increments that generation;
+the next check returns to Idle and starts a fresh low-ratio grace if eligible.
+An `EAGAIN` range remains reclaimable, so retry work does not need a new Free
+to keep the controller active. Retry timing is described below.
 
 ### Allocate path: transactional pre-write backing admission
 
@@ -390,14 +442,15 @@ the user pointer.
 
 Every small-bin, tree-bin, designated-victim, and top-chunk source path therefore
 calls the preparation hook after selecting the source interval but before its
-first metadata mutation. The hook first enumerates the complete mutation write
-set and partitions it:
+first metadata mutation. The hook receives the selected chunk, source size, and
+allocated size and computes a page-aligned allocation envelope. The safety
+argument distinguishes three kinds of write target:
 
 - process-local allocator state is outside the primary file;
 - non-local bin/tree neighbor nodes and other allocator metadata inside the
   primary mapping must already be on protected `COMMITTED` pages; and
-- source-local pages that can legally be `CANDIDATE` or `NEEDS_RECOMMIT` form
-  the page-aligned **sparse-capable allocation envelope**.
+- source-local pages that may be candidates or require recommit belong to the
+  **sparse-capable allocation envelope**.
 
 The sparse-capable envelope includes:
 
@@ -410,29 +463,29 @@ The sparse-capable envelope includes:
 
 Process-local allocator state such as bin roots or `malloc_state` must also wait
 until admission succeeds, but its addresses do not enter the file envelope.
-Likewise, distant free-node links are not allowed to expand one small allocation
-into an arena-spanning `fallocate`: the ledger invariant permanently excludes
-their metadata pages from `CANDIDATE` and `NEEDS_RECOMMIT`. Before mutation, the
-hook asserts that every primary-arena write target is either a protected
-`COMMITTED` metadata page or part of the sparse-capable envelope; an unclassified
-target fails closed as an invariant error.
+Likewise, distant free-node links must not expand one small allocation into an
+arena-spanning `fallocate`: their current metadata pages remain protected.
+Allocator-path tests must establish that every primary-arena write target is
+either protected metadata or covered by the envelope. The hook validates the
+selected interval and computes its envelope; it does not enumerate and classify
+each distant metadata write at runtime.
 
 Untouched tail bytes of the source free chunk are excluded. For pages in the
 envelope:
 
-1. `CANDIDATE` is canceled to `COMMITTED`;
-2. `BUSY/REMOVE` is waited on or retried under the ownership protocol;
-3. all `NEEDS_RECOMMIT` pages are claimed as `BUSY/COMMIT`;
-4. if any backing is required, one
-   `fallocate(FALLOC_FL_KEEP_SIZE)` covers the minimum-to-maximum page range of
-   the sparse-capable envelope; and
-5. only after success are all envelope pages made `COMMITTED` and dlmalloc
-   allowed to cross its mutation point.
+1. allocation enters with no outstanding REMOVE claim, under the same allocator
+   serialization gate;
+2. if any envelope page has `recommit_required` set, one
+   `fallocate(FALLOC_FL_KEEP_SIZE)` range covers the whole envelope, including
+   any already backed pages between sparse pages;
+3. after successful preparation, both bitmap bits are cleared throughout the
+   envelope, canceling any candidate or pending retry there; and
+4. dlmalloc may then cross its mutation point and return the allocation.
 
-On failure, RAII cleanup restores every page to its pre-admission state
-(`CANDIDATE` stays a reclaim candidate and sparse pages return to
-`NEEDS_RECOMMIT`), allocator topology remains unchanged, no buffer or
-object-table entry is exposed, and the Create request receives a typed error.
+On failure, the bitmap has not yet been changed: candidates and retry-pending
+pages retain their previous states without rollback. Allocator topology remains
+unchanged, no buffer or object-table entry is exposed, and the Create request
+receives a typed error.
 The implementation must not retry this failure through GC, spill, or a fallback
 allocation whose semantics would hide the backing admission failure.
 
@@ -445,15 +498,16 @@ within Ray's ownership boundary.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> DISABLED
-  DISABLED --> IDLE: enabled and capability probe passes
+  [*] --> DISABLED: disabled by configuration or preflight
+  [*] --> IDLE: enabled and startup validation succeeds
   IDLE --> TRIMMING: L/P below plasma_physical_trim_start_ratio for plasma_physical_trim_low_ratio_grace_ms
   TRIMMING --> IDLE: L/P reaches plasma_physical_trim_stop_ratio
-  TRIMMING --> SUSPENDED_OOM: Create pressure or OOM path
-  SUSPENDED_OOM --> IDLE: pressure clears and cooldown expires
-  TRIMMING --> NO_PROGRESS: full ledger pass removes nothing
-  NO_PROGRESS --> TRIMMING: new candidate or remove-retry deadline
-  NO_PROGRESS --> IDLE: L/P reaches plasma_physical_trim_stop_ratio or new episode is required
+  IDLE --> SUSPENDED_OOM: primary allocation pressure
+  TRIMMING --> SUSPENDED_OOM: primary allocation pressure
+  NO_PROGRESS --> SUSPENDED_OOM: primary allocation pressure
+  SUSPENDED_OOM --> IDLE: separate callback observes no pending primary Create
+  TRIMMING --> NO_PROGRESS: no reclaimable pages remain
+  NO_PROGRESS --> IDLE: new eligible pages or L/P reaches plasma_physical_trim_stop_ratio
 ```
 
 `DISABLED` describes the trim controller. If a fatal trim error occurs after
@@ -461,25 +515,56 @@ holes may exist, new removal is fused off, but page-state tracking and allocatio
 admission remain active until the arena is destroyed. They must never be disabled
 merely because the trim controller is disabled.
 
-`SUSPENDED_OOM` gives Create, spill, and eviction recovery priority and applies
-a one-second cooldown after pressure clears. `NO_PROGRESS` prevents hot
-polling, but a pending transient remove-retry pass uses its own bounded backoff
-and does not require a new Free operation to make progress.
+`SUSPENDED_OOM` denotes suspension for primary allocation pressure. A pending
+primary-arena Create or an observed primary allocation OOM cancels scheduled
+trimming and enters this state, giving Create, spill, and eviction recovery
+priority. The OOM observation survives a later successful allocation, including
+eviction recovery or fallback success. A device-selection error is not primary
+arena pressure.
+
+Once no primary Create remains pending, a separate zero-delay callback returns
+the controller to `IDLE` without sampling usage or reclaiming pages. The first
+usage sample then waits for `plasma_physical_trim_check_interval_ms`. Trimming
+requires a fresh `plasma_physical_trim_low_ratio_grace_ms` below the start ratio.
+With the defaults, this is a separate callback, a 1 s wait before sampling, and
+a new 30 s low-ratio grace; there is no independent OOM-resume cooldown setting.
+
+Normal foreground traffic uses a different scheduling rule. While `TRIMMING`,
+processing a Create, Get, or Seal request replaces an ordinary trim continuation
+with a fixed eligibility check after
+`plasma_physical_trim_foreground_max_defer_ms`. Later requests do not extend that
+deadline, and existing controller checks, including retry backoff, are preserved.
+The deadline still checks allocation pressure and trim eligibility; it does not
+guarantee a quantum or a hard execution time. If it runs a quantum and trimming
+continues, the next ordinary continuation waits at least one controller-check
+interval. This prevents continuous foreground traffic from indefinitely pushing
+back the eligibility check while preserving opportunities to serve requests.
+
+`NO_PROGRESS` performs no page scan while the free generation is unchanged. A
+newly eligible page or a ratio reaching the stop threshold returns it to Idle.
+If trimming remains eligible, transient `EAGAIN` leaves retry work in
+`TRIMMING`, using the ordinary controller-check interval as backoff without
+requiring a new Free.
 
 ### Bounded execution, concurrency, and shutdown
 
-Each quantum is bounded by:
+With the default configuration, each quantum uses:
 
 - at most 128 MiB worth of ledger pages inspected;
-- at most 128 MiB successfully advised;
-- at most 32 REMOVE syscall entries, counting retries, as an independent
-  attempt cap;
 - at most 4 MiB in one `MADV_REMOVE` call; and
-- a 10 ms soft wall-clock budget checked between calls.
+- a 10 ms soft wall-clock budget checked before starting another claim and
+  after an interrupted syscall.
+
+Successfully advised bytes cannot exceed the inspected address-space budget:
+claimed ranges do not overlap within a turn. This is a consequence of scanning,
+not an independent advice counter limit. There is no separate 32-call cap;
+fragmented ranges and `EINTR` retries can produce more calls than
+`128 MiB / 4 MiB`.
 
 The deadline is soft because a running kernel syscall is not interruptible by
-the controller. PoC-A therefore informs the 4 MiB cap, while real Store Create
-latency remains an acceptance measurement.
+the controller. An already claimed range is also finalized even if scanning it
+crossed the deadline. PoC-A therefore informs the 4 MiB cap, while real Store
+Create latency remains an acceptance measurement.
 
 The ledger is accessed in the same external serialization domain as allocator
 mutation and therefore does not require an independently acquired page-state
@@ -490,16 +575,18 @@ order is:
 allocator mutation gate -> page-state lock
 ```
 
-REMOVE and COMMIT execute synchronously while allocator mutation is excluded.
-The callback checks already queued Create pressure before starting a turn.
+REMOVE and backing admission execute synchronously while allocator mutation is
+excluded. The callback checks already queued Create pressure before starting a turn.
 Because new event-loop requests are not observable inside that synchronous turn,
-the independent budgets bound their delay; the callback then returns and posts
-at most one successor. Shutdown first prevents new quantums, then waits for the
-current synchronous turn before destroying the allocator, file descriptor, page
-ledger, or Store callbacks.
+Create priority applies between quantums: a request arriving during
+claim/REMOVE/finalize waits for the current Store critical section to finish.
+The budgets limit work before yielding but do not impose a hard request-latency
+bound. The callback returns and posts at most one successor. Shutdown first
+prevents new quantums, then waits for the current synchronous turn before
+destroying the allocator, file descriptor, page ledger, or Store callbacks.
 
 A syscall-offload implementation must preserve explicit range ownership,
-quarantine `BUSY` ranges from allocator reuse, cancel or join work at shutdown,
+quarantine in-flight ranges from allocator reuse, cancel or join work at shutdown,
 and prove the same lock order. It is not an implementation detail that can be
 added without revisiting the concurrency proof.
 
@@ -510,29 +597,33 @@ hole in the underlying file while preserving the VMA and file length. A later
 read returns zero and a later write allocates backing again
 ([`madvise(2)`](https://man7.org/linux/man-pages/man2/madvise.2.html)).
 
-If the syscall succeeds, is interrupted after entry, returns a result with
-partial/unknown effect, or otherwise may have reached the kernel, every page in
-the issued range becomes `NEEDS_RECOMMIT`. Only an error proven to occur before
-syscall entry may restore `CANDIDATE`. Allocation admission therefore remains
-safe even when reclaim accounting is ambiguous.
+Once REMOVE may have entered the kernel, finalization sets
+`recommit_required` on every page in the issued range, even if its effect is
+partial or unknown. Success clears `reclaimable`, producing `NEEDS_RECOMMIT`.
+A retryable result keeps `reclaimable` set, producing `RETRY_PENDING`.
+If REMOVE was not attempted, finalization preserves the previous state.
 
-A transient `EAGAIN` must not strand the last candidates in
-`NO_PROGRESS`. Immediate retries are finite. If they are exhausted while
-reclaim remains eligible, the controller sets the fixed retry bits for the 2 MiB
-regions overlapping the failed range and schedules a bounded retry pass after
-capped backoff, even if no Allocate or Free occurs. A persistent region/page
-retry cursor visits only marked regions, claims their `NEEDS_RECOMMIT` pages as
-`BUSY/REMOVE`, rechecks safety under the allocator gate, and applies the same
-scan, advice, call-count, range, and time budgets as a normal turn.
+`EINTR` retries the same range immediately. If the soft quantum deadline has
+expired when an interrupted call returns, the result is treated as `EAGAIN`.
+`EAGAIN` ends the current quantum; if the ratio still requires trimming, the
+controller remains `TRIMMING` and schedules its next check after
+`plasma_physical_trim_check_interval_ms`. A permanent error instead disables new
+removal while keeping backing admission active.
 
-An overlapping allocation recommits only its envelope to `COMMITTED` and does
-not clear a region retry bit. The retry pass skips those committed pages while
-preserving and visiting every non-overlapping `NEEDS_RECOMMIT` tail. After a
-marked region is fully inspected without a new transient failure, its bit is
-cleared; another `EAGAIN` leaves it set and schedules another capped-backoff
-pass. Coarse regions can cause bounded redundant REMOVE work inside an affected
-2 MiB region, but one failure cannot trigger an arena-wide rescan. Page safety
-continues to come from `NEEDS_RECOMMIT`, not from retry metadata.
+The cursor has already advanced past the failed range. Subsequent quantums
+continue through the suffix, then wrap and revisit any retry-pending pages.
+Even a failure on the final candidate leaves scheduled work, without needing an
+intervening Allocate or Free. There is no separate retry pass or exponential
+backoff, and the failed range is not necessarily retried by the next callback.
+Allocation pressure, ratio changes, the remaining scan distance, and event-loop
+scheduling can delay a revisit; the check interval is not a fixed completion
+bound for that range.
+
+An overlapping allocation must admit its envelope before reuse. Success clears
+both bits only within that envelope; any non-overlapping retry-pending tail
+remains eligible for the same cursor. Ordinary `NEEDS_RECOMMIT` pages have no
+pending REMOVE work and are skipped. This preserves retry progress without
+dynamic retry metadata or repeatedly advising successfully removed pages.
 
 ### Environment gates and error handling
 
@@ -548,14 +639,15 @@ The experiment is eligible only when all of the following are true:
 An unsupported environment discovered before removal logs the reason and leaves
 the trimmer disabled without preventing raylet startup.
 
-For REMOVE, `EINTR` and `EAGAIN` use finite immediate retry. A still-transient
-result is deferred to the bounded retry pass above. Any range that may have
-entered the kernel remains `NEEDS_RECOMMIT`. Permanent errors fuse new trimming,
+For REMOVE, `EINTR` uses immediate retry until the soft deadline is observed;
+`EAGAIN` yields to the interval-based continuation described above. Every issued
+range retains its recommit requirement. Permanent errors fuse new trimming,
 increment an errno-labeled metric, and preserve admission.
 
 For allocation admission:
 
-- `EINTR` retries the same sparse-capable envelope a finite number of times;
+- `EINTR` retries the same sparse-capable envelope; this synchronous admission
+  loop has no configured attempt or time cap;
 - `ENOSPC` and `EDQUOT` map to a backing-store-capacity status and the
   ordinary Object Store full error seen by `ray.put`;
 - every other errno, including `ENOMEM`, maps to a distinct backing-store
@@ -584,21 +676,19 @@ The proposed configuration is internal, experimental, and disabled by default.
 | `plasma_physical_trim_start_ratio` | `0.50` | Start eligibility when `L/P` is strictly below this value. |
 | `plasma_physical_trim_stop_ratio` | `0.60` | Stop when `L/P` reaches this value. |
 | `plasma_physical_trim_low_ratio_grace_ms` | `30000` | Required continuous low-ratio period. |
-| `plasma_physical_trim_check_interval_ms` | `1000` | Idle, suspended, retry, and no-progress polling interval. |
+| `plasma_physical_trim_check_interval_ms` | `1000` | Idle/no-progress checks and retry backoff; also precedes the first post-pressure usage sample. |
 | `plasma_physical_trim_quantum_bytes` | `128 MiB` | Maximum scan/advice work per Store turn. |
 | `plasma_physical_trim_syscall_bytes` | `4 MiB` | Maximum range per `MADV_REMOVE` call. |
 | `plasma_physical_trim_quantum_time_ms` | `10` | Soft scan/syscall time budget per turn. |
-| `plasma_physical_trim_min_yield_ms` | `0` | Minimum delay before posting the next trim turn. |
-| `plasma_physical_trim_oom_resume_cooldown_ms` | `1000` | Cooldown after Create pressure clears. |
+| `plasma_physical_trim_min_yield_ms` | `0` | Minimum ordinary continuation delay; a fixed foreground eligibility check may run earlier. |
+| `plasma_physical_trim_foreground_max_defer_ms` | `1000` | Fixed delay from the first Create/Get/Seal request during trimming to an eligibility check; later requests do not extend it. Zero disables this deferral. |
 
 Validation requires page-aligned byte limits,
 `page_size <= syscall_bytes <= quantum_bytes`,
 `0 < start_ratio < stop_ratio <= 1`, and non-overflowing timing values.
-Each trim quantum also enforces an internal cap of 32 REMOVE syscall entries per
-turn. That number matches `quantum_bytes / syscall_bytes` for contiguous
-default-size ranges, but it is enforced independently because fragmented
-candidates and `EINTR` retries can produce more calls without exhausting the byte
-budget.
+The syscall count is observed rather than independently capped. Dividing
+`quantum_bytes` by `syscall_bytes` predicts the count only for contiguous,
+full-size ranges without retries.
 
 ### Observability
 
@@ -608,16 +698,16 @@ observed reclaim, and allocation admission:
 | Metric family | Purpose |
 |---|---|
 | Primary logical/backing bytes and `L/P` | Report the controller inputs for the exact primary fd. |
-| Ledger storage, page states, and region summaries | Report ledger/region bytes; count `COMMITTED`, `CANDIDATE`, `NEEDS_RECOMMIT`, `BUSY`, and retry-marked regions; expose summary hits and conservative false positives. |
+| Ledger storage, persistent page states, and in-flight claims | Report bitmap bytes and counts of `COMMITTED`, `CANDIDATE`, `NEEDS_RECOMMIT`, and `RETRY_PENDING`; observe the in-flight claim separately. |
 | Scanned pages/words, cursor, full-ledger passes, and `NO_PROGRESS` | Compare each turn with `B`, report quantums per pass, and demonstrate topology-independent bounded inspection. |
 | Advised versus observed-reclaimed bytes | Keep requested `MADV_REMOVE` work separate from `st_blocks` change. |
-| Quantum/REMOVE counts, ranges, errno, total duration, and maximum call duration | Expose all four budgets, amplification, retries, and serialized stalls. |
+| Quantum/REMOVE counts, ranges, errno, total duration, and maximum call duration | Expose scan and range limits, soft-deadline behavior, amplification, retries, and serialized stalls. |
 | Whole-envelope `fallocate` calls, bytes, errno, repeated prepares, total duration, and maximum call duration | Expose backing-admission cost, redundancy, and failure. |
 | Create p50/p99/p999/max latency | Measure end-to-end user-visible impact rather than inferring it from syscall timing. |
 
 The existing aggregate `object_store_physical_bytes` remains an observation
 metric for compatibility, but it is not the denominator because it may include
-fallback files. High-cardinality operation ids and page offsets remain in
+fallback files. High-cardinality page offsets remain in
 debug/test telemetry, not exported labels.
 
 ## Compatibility, Deprecation, and Migration Plan
@@ -767,17 +857,18 @@ transitions, bootstrap safety, transient retry, or transactional recommit.
 
 The architecture above is the normative target, not an assertion that a current
 implementation already satisfies every transition. In particular, complete
-bootstrap coverage, COMMIT ownership/cleanup, transient REMOVE retry without a
-new Free, the independent quantum budgets, and the expanded admission/ledger
-metrics below are merge criteria until demonstrated on the final head.
+bootstrap coverage, admission failure preserving page state and allocator
+topology, transient REMOVE retry without a new Free, the documented quantum
+limits, and the expanded admission/ledger metrics below are merge criteria until
+demonstrated on the final head.
 
 Before merge, the final implementation must include:
 
-1. **Ledger and controller tests:** all four states, packed-word boundaries,
-   summary maintenance, claim/finalize and RAII cleanup, cursor wrap, ratio
-   hysteresis, OOM suspension, Create priority, full-pass `NO_PROGRESS`, and a
-   reference oracle proving `CANDIDATE` is always a metadata-safe current free
-   page.
+1. **Ledger and controller tests:** all four persistent states, both bitmap
+   bits, packed-word boundaries, claim/finalize, cursor wrap, ratio hysteresis,
+   OOM suspension, Create priority, `NO_PROGRESS` when no reclaimable pages
+   remain, and a reference oracle proving `CANDIDATE` is always a metadata-safe
+   current free page.
 2. **Allocator hook tests:** small-bin, tree-bin, designated-victim, and top
    allocation sources; exact-page boundaries; alignment; split, forward
    coalesce, and backward coalesce; headers, boundary tags, mutable Plasma
@@ -790,11 +881,13 @@ Before merge, the final implementation must include:
    steady-state admission hook is active, and prove that a non-4-KiB system page
    size is rejected before sparse-state tracking begins in the proposed scope.
 4. **REMOVE fault tests:** no-call, success, partial/unknown effect, `EINTR`,
-   `EAGAIN`, and permanent errors. A final-candidate `EAGAIN` case must retry
-   within a bound without any intervening Allocate or Free, while overlapping
-   allocation still forces recommit before mutation. Repeated partial overlaps
-   must preserve retry progress for every non-overlapping tail without growing
-   dynamic retry metadata.
+   `EAGAIN`, and permanent errors. A final-candidate `EAGAIN` case must remain
+   scheduled and retry without any intervening Allocate or Free while trimming
+   remains eligible and allocation pressure is absent. Verify scan limits on
+   each turn and cursor wrap before revisiting a failed range. Overlapping
+   allocation must still force recommit before mutation. Repeated partial
+   overlaps must preserve retry progress for every non-overlapping tail without
+   growing dynamic retry metadata.
 5. **Admission fault tests:** mixed committed/sparse envelopes and injected
    `EINTR`, `ENOSPC`, `EDQUOT`, `ENOMEM`, `EOPNOTSUPP`, and invariant
    errors. Assert that failure leaves topology unchanged, exposes no buffer,
@@ -809,9 +902,11 @@ Before merge, the final implementation must include:
    again; and capacity exhaustion returns an ordinary error instead of
    `SIGBUS`.
 8. **Store, protocol, shutdown, and metrics tests:** task deduplication, Create
-   queue priority, OOM suspend/resume, disconnect/error completion, internal
-   reply encoding, task error wrapping, no dangling callback, advised versus
-   observed bytes, state counts, errno, and duration distributions.
+   queue priority, OOM suspension even after fallback success, separate-turn
+   resume with fresh ratio grace, non-extending Create/Get/Seal deadlines,
+   foreground requests waiting for an active quantum, disconnect/error completion,
+   internal reply encoding, task error wrapping, no dangling callback, advised
+   versus observed bytes, state counts, errno, and duration distributions.
 
 These are acceptance criteria, not claims about an in-progress implementation.
 All required checks must pass on the final implementation head. Source-level
@@ -840,8 +935,8 @@ Acceptance requires:
 - `L/P` to move toward `plasma_physical_trim_stop_ratio` as physical backing is
   reclaimed when certified backed free pages exist, otherwise enter
   `NO_PROGRESS` without spinning;
-- every syscall and Store turn to respect scan, advice, call-count, range, and
-  soft-time budgets at their documented boundaries;
+- every syscall and Store turn to respect scan and range limits and the
+  documented soft-deadline behavior;
 - a sustained Create storm to show Create priority and no event-loop starvation;
 - disabled-mode Create/Delete/eviction performance to remain within benchmark
   noise; and
@@ -862,8 +957,8 @@ and be covered by source assertions and allocator-path tests.
 
 A page incorrectly marked `COMMITTED` or `CANDIDATE` can be written without
 backing admission or removed while live. Uncertain initialization and syscall
-results therefore move toward `NEEDS_RECOMMIT`; only allocator-certified
-events move away from it. Conservative false positives cost extra
+results therefore retain the recommit-required bit; only successful admission
+clears it for an allocation. Conservative false positives cost extra
 `fallocate`, which is preferable to `SIGBUS`.
 
 ### Synchronous tail latency
@@ -886,11 +981,12 @@ model.
 ### Transient remove ambiguity
 
 A syscall may have partially removed a range even when it returns an error.
-Treating every possibly issued range as `NEEDS_RECOMMIT` preserves safety, but
-a bounded retry pass is required to avoid silently losing reclaim liveness. Its
-fixed region bitmap/cursor, capped cadence, partial-overlap behavior, and
-interaction with allocation must be observable and tested without relying on a
-new Free generation.
+Keeping the recommit-required bit on every possibly issued range preserves
+safety. A retryable failure also retains the reclaimable bit, so the uniform
+cursor can revisit it without a new Free generation. Interval backoff,
+wraparound, partial-overlap behavior, and allocation admission must be observable
+and tested. The time until a particular failed range is revisited also depends on
+scan distance, allocation pressure, policy, and event-loop scheduling.
 
 ### Conservative reclaim and fragmentation
 
