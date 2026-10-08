@@ -348,19 +348,6 @@ safe_begin = AlignUp(chunk_begin + required_leading_metadata, page_size)
 safe_end   = AlignDown(chunk_end, page_size)
 ```
 
-```mermaid
-flowchart LR
-  subgraph FREE["Final coalesced free chunk: chunk_begin to chunk_end, end excluded"]
-    direction LR
-    H["Protected pages<br/>final header and free-list/tree links"]
-    I["Complete interior pages<br/>safe_begin to safe_end, end excluded"]
-    T["Optional trailing partial page<br/>protected"]
-    H --- I --- T
-  end
-  N["Next chunk or reserved segment tail<br/>protected boundary metadata"]
-  T --- N
-```
-
 The leading pages remain protected even if only part of a page contains
 bookkeeping. The optional trailing partial page cannot be removed because it
 also contains boundary metadata from the next chunk or reserved tail. If
@@ -404,6 +391,72 @@ The controller starts only after
 
 No raw dlmalloc pointer, chunk offset, or topology generation is retained across
 turns. Allocations and frees update page states but never reset the page cursor.
+
+The header address comes from dlmalloc's own free operation.
+`PlasmaAllocator::Free` passes the allocation address to `dlfree()`, which
+recovers the original chunk with `mem2chunk(mem)`: subtract two `size_t`
+words from the allocator's user pointer. If a free predecessor is merged,
+dlmalloc moves `p` back to that predecessor; forward merging extends the size.
+The header to preserve is therefore at the **final coalesced `p`**, which need
+not be the original chunk address.
+
+The post-free hook passes that final pointer, chunk size, and
+`bookkeeping_size` to `PlasmaAllocator::AfterFreeHook` / `MarkFreeRange`.
+The four free-chunk roles below explain which metadata is in the chunk and which
+leading prefix the hook protects. The chunk address is always the final `p`;
+its role determines the prefix size, not a different way to discover the header.
+
+| Free-chunk role | Metadata in the chunk | Leading prefix `k` supplied by the post-free hook |
+|---|---|---|
+| smallbin | `malloc_chunk`: `prev_foot`, `head`, `fd`, `bk`. | `sizeof(malloc_chunk)` |
+| treebin | The same fields plus `child[2]`, `parent`, and `index`. | `sizeof(malloc_tree_chunk)` |
+| designated victim (`dv`) | `p->head` remains in the chunk; bin links are not maintained while it is the dv. The dv pointer and cached size live in `malloc_state`. | Conservatively use `sizeof(malloc_chunk)` when `is_small(s)`, otherwise `sizeof(malloc_tree_chunk)`. |
+| top | `p->head` remains in the chunk. The top pointer and cached size live in `malloc_state`; a fake trailing header also exists in the reserved segment tail. | Conservatively use `sizeof(malloc_tree_chunk)`. |
+
+The dv and top prefixes are conservative exclusions, not claims that those
+chunks currently use every field of a list/tree node. In particular, caching
+`dvsize` or `topsize` in `malloc_state` does not remove the chunk's own `head`.
+The hook does not reduce the dv prefix to one word or the top prefix to zero.
+The reserved top tail is excluded by the chunk-end boundary separately. These
+allocator-supplied boundaries establish the protected interval before page
+alignment.
+
+The two views below use the same addresses before and after one successful
+REMOVE, with no intervening allocation. The example assumes 64-bit words and
+pointers, no neighbor coalescing, `mem = 4160`, a 16 KiB chunk, and 64 bytes of
+large-chunk bookkeeping. Thus `p = 4160 - 16 = 4144`,
+`metadata_end = 4208`, and `chunk_end = 20528`. Page alignment leaves only
+`[8192, 20480)` eligible. Both boundary pages stay backed; the virtual mapping
+and the surviving metadata do not move.
+
+![Before REMOVE: header and free interior are backed.](2026-08-19-plasma-physical-page-reclamation/header-before-remove.png)
+
+![After REMOVE: the same header stays backed while the complete interior pages lose backing.](2026-08-19-plasma-physical-page-reclamation/header-after-remove.png)
+
+The flow traces where the protected address range comes from and how it is
+excluded from removal:
+
+```mermaid
+flowchart TD
+  A["PlasmaAllocator::Free calls dlfree(mem)"]
+  A --> B["Recover the original chunk<br/>p = mem2chunk(mem)<br/>p = (char*)mem - 2 * sizeof(size_t)"]
+  B --> C["Coalesce adjacent free chunks<br/>A free predecessor moves p backward<br/>Keep final chunk start p and size s"]
+  C --> D{"Which role does the final free chunk have?"}
+  D -->|smallbin| E["k = sizeof(malloc_chunk)"]
+  D -->|treebin| F["k = sizeof(malloc_tree_chunk)"]
+  D -->|dv| V["Conservative prefix k<br/>is_small(s): sizeof(malloc_chunk)<br/>otherwise: sizeof(malloc_tree_chunk)"]
+  D -->|top| T["k = sizeof(malloc_tree_chunk)<br/>Conservative prefix; head remains in the chunk"]
+  E --> G["Post-free hook passes final p, s, k<br/>to PlasmaAllocator::MarkFreeRange"]
+  F --> G
+  V --> G
+  T --> G
+  G --> H["Protect the leading prefix [p, p + k)<br/>safe_begin = AlignUp(p + k, page_size)<br/>safe_end = AlignDown(p + s, page_size)"]
+  H --> I["Certify eligible complete interior pages<br/>Later MADV_REMOVE uses only those pages<br/>Every page touched by the surviving metadata is excluded"]
+  I --> J["Surviving allocator metadata stays in place<br/>The pages containing it keep their backing"]
+  classDef preserved fill:#fff0d9,stroke:#825000,color:#533400;
+  class G,H,J preserved;
+```
+
 Here `B = plasma_physical_trim_quantum_bytes / page_size` (32,768 pages with
 the proposed defaults) is a maximum per-turn scan budget. A full pass completes
 after cumulative inspected pages reach `N`, because no allocator mutation
